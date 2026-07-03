@@ -74,7 +74,7 @@ IDLE_SCAN = env_int("CLASHPILOT_IDLE_SCAN", 1)
 # Re-probe a switch candidate this many extra times before committing the
 # switch, requiring every probe to pass, so autoswitch doesn't land on a node
 # that only works intermittently. 0 disables the re-check.
-SWITCH_CONFIRM_ATTEMPTS = env_int("CLASHPILOT_SWITCH_CONFIRM_ATTEMPTS", 2)
+SWITCH_CONFIRM_ATTEMPTS = env_int("CLASHPILOT_SWITCH_CONFIRM_ATTEMPTS", 1)
 # Cap how many top-ranked candidates get re-probed when the best one fails, so
 # a scan where everything is flaky can't blow up into a probe storm.
 SWITCH_CONFIRM_CANDIDATES = env_int("CLASHPILOT_SWITCH_CONFIRM_CANDIDATES", 5)

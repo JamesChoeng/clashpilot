@@ -39,7 +39,7 @@ from .health import (
 from .logutil import LOG_FILE, log, notify, set_console_notify, tail_log
 from .opus import maybe_refresh_opus_whitelist, refresh_opus_whitelist
 from .proxy_ctrl import current_node, current_node_chain, fetch_proxies, has_active_target_connection, target_group
-from .selector import format_scan, pick_and_switch, switch_to
+from .selector import format_scan, pick_and_switch, pin_to, switch_to, unpin
 
 PID_FILE = STATE_DIR / "clashpilot.pid"
 _TUN_FAIL_MARKER = "Start TUN listening error"
@@ -305,7 +305,7 @@ def _recover_core(group: str | None = None) -> bool:
         if _wait_controller(20):
             log("== core restarted; controller reachable")
             if group:
-                pick_and_switch(group)
+                pick_and_switch(group, emergency=True)
             return True
         log("!! core restarted but controller still unreachable -- check core log")
     except Exception as e:  # noqa: BLE001
@@ -485,7 +485,7 @@ def _run_loop(manage_subscription: bool = False) -> None:
                             log(f"current node confirmed DOWN ({reason}) -> failover")
                             if cur:
                                 bench_nodes(cur, f"failed health loop ({reason})")
-                            result = pick_and_switch(group)
+                            result = pick_and_switch(group, emergency=True)
                             if result.get("action") == "switched":
                                 failovers += 1
                             reset_health_failures()
@@ -557,6 +557,8 @@ __all__ = [
     "set_node",
     "stop_daemon",
     "switch_to",
+    "pin_to",
+    "unpin",
     "tail_log",
     "target_group",
 ]

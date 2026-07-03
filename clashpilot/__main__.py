@@ -254,6 +254,12 @@ def _cmd_status(_args: argparse.Namespace) -> int:
             out(f"  opus wl:      {len(wl)} nodes (Opus-region pool)")
         else:
             out("  opus wl:      active, not scanned yet")
+        chain = config.pinned_chain()
+        if chain:
+            if len(chain) > 1:
+                out(f"  pinned:       {' > '.join(chain)} (failover only)")
+            else:
+                out(f"  pinned:       {chain[0]} (failover only)")
         last = config.last_switch()
         if last:
             import datetime
@@ -293,6 +299,23 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             )
         )
     )
+    return 0
+
+
+def _cmd_pin(args: argparse.Namespace) -> int:
+    api.reconfigure()
+    if not core.core_running():
+        print(
+            "error: core is not running — start clashpilot first (clashpilot up)",
+            file=sys.stderr,
+        )
+        return 1
+    print(_console_safe(daemon.pin_to(*args.nodes)))
+    return 0
+
+
+def _cmd_unpin(_args: argparse.Namespace) -> int:
+    print(_console_safe(daemon.unpin()))
     return 0
 
 
@@ -482,6 +505,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="scan every subscription node, not just the Opus whitelist pool",
     )
     scan.set_defaults(func=_cmd_scan)
+
+    pin = sub.add_parser(
+        "pin",
+        help="Pin to a node (autoswitch only on failure); optionally add fallbacks in priority order.",
+    )
+    pin.add_argument(
+        "nodes",
+        nargs="+",
+        help="primary node, then optional fallback nodes in priority order, e.g. 美国01 日本专线01",
+    )
+    pin.set_defaults(func=_cmd_pin)
+
+    sub.add_parser("unpin", help="Clear the pinned node.").set_defaults(func=_cmd_unpin)
 
     sp = sub.add_parser("set-sub", help="Save your Clash/Mihomo subscription URL.")
     sp.add_argument("url")

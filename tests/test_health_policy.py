@@ -58,6 +58,79 @@ class SwitchPolicyTest(unittest.TestCase):
         decision = decide(ctx)
         self.assertEqual(decision.action, "pending")
 
+    def test_keeps_pinned_node_despite_faster_candidate(self) -> None:
+        import unittest.mock as mock
+
+        from clashpilot import config
+
+        ctx = SwitchContext(
+            group="AUTO",
+            cur="node-a",
+            cur_score=100.0,
+            best="node-b",
+            best_score=60.0,
+            ranking=[("node-b", 60.0), ("node-a", 100.0)],
+            nodes=["node-a", "node-b"],
+            last_switch_ts=0.0,
+            defer_count=0,
+            faster_candidate=None,
+            faster_since=0.0,
+        )
+        with mock.patch.object(config, "pinned_chain", return_value=["node-a"]):
+            decision = decide(ctx)
+        self.assertEqual(decision.action, "kept")
+        self.assertEqual(decision.reason, "pinned")
+
+    def test_falls_back_to_next_chain_node_when_primary_dead(self) -> None:
+        import unittest.mock as mock
+
+        from clashpilot import config
+
+        ctx = SwitchContext(
+            group="AUTO",
+            cur="node-a",
+            cur_score=None,
+            best="node-c",
+            best_score=200.0,
+            ranking=[("node-b", 150.0), ("node-c", 200.0)],
+            nodes=["node-a", "node-b", "node-c"],
+            last_switch_ts=0.0,
+            defer_count=0,
+            faster_candidate=None,
+            faster_since=0.0,
+        )
+        with mock.patch.object(config, "pinned_chain", return_value=["node-a", "node-b"]):
+            decision = decide(ctx)
+        self.assertEqual(decision.action, "switched")
+        self.assertEqual(decision.reason, "pinned failover")
+        self.assertEqual(decision.to_node, "node-b")
+        self.assertTrue(decision.force)
+
+    def test_restores_to_higher_priority_chain_node_once_alive(self) -> None:
+        import unittest.mock as mock
+
+        from clashpilot import config
+
+        ctx = SwitchContext(
+            group="AUTO",
+            cur="node-b",
+            cur_score=150.0,
+            best="node-b",
+            best_score=150.0,
+            ranking=[("node-a", 100.0), ("node-b", 150.0)],
+            nodes=["node-a", "node-b"],
+            last_switch_ts=0.0,
+            defer_count=0,
+            faster_candidate=None,
+            faster_since=0.0,
+        )
+        with mock.patch.object(config, "pinned_chain", return_value=["node-a", "node-b"]):
+            decision = decide(ctx)
+        self.assertEqual(decision.action, "switched")
+        self.assertEqual(decision.reason, "pinned restore")
+        self.assertEqual(decision.to_node, "node-a")
+        self.assertFalse(decision.force)
+
 
 class ConfigLastSwitchTest(unittest.TestCase):
     def test_save_and_load_last_switch(self) -> None:

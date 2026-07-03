@@ -47,7 +47,8 @@ def _reset_faster_tracking() -> None:
 
 
 def score(node: str) -> float | None:
-    results = [delay(node, u) for u in TARGETS]
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(TARGETS))) as pool:
+        results = list(pool.map(lambda u: delay(node, u), TARGETS))
     vals = [r for r in results if r is not None]
     if not vals:
         return None
@@ -83,6 +84,45 @@ def rank_nodes(nodes: list[str] | None = None) -> list[tuple[str, float]]:
                 scored.append((node, _smooth_score(node, s)))
     scored.sort(key=lambda t: t[1])
     return scored
+
+
+def find_fast_node(nodes: list[str]) -> tuple[str, float] | None:
+    """Return the first reachable node; for emergency failover without a full scan."""
+    if not nodes:
+        return None
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(score, node): node for node in nodes}
+        try:
+            for fut in cf.as_completed(futures):
+                node = futures[fut]
+                try:
+                    s = fut.result()
+                except Exception:  # noqa: BLE001
+                    continue
+                if s is not None:
+                    return node, _smooth_score(node, s)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+def find_fast_chain_node(chain: list[str], candidates: list[str]) -> tuple[str, float] | None:
+    """Probe pinned-chain members (in priority order) and return the first
+    reachable one, ignoring which probe happened to finish first.
+
+    Used by emergency failover so a dead pinned primary fails over to the
+    user's designated next-in-chain node instead of racing the whole pool.
+    """
+    pool = [n for n in chain if n in candidates]
+    if not pool:
+        return None
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(pool))) as ex:
+        scores = dict(zip(pool, ex.map(score, pool)))
+    for node in pool:
+        s = scores.get(node)
+        if s is not None:
+            return node, _smooth_score(node, s)
+    return None
 
 
 def do_switch(
@@ -130,6 +170,12 @@ def _switch_to_confirmed(
     reason: str = "failover",
     from_node: str | None = None,
 ) -> tuple[str, float, bool]:
+    # Forced switches (failover, dead node, benched) already ran a full rank scan;
+    # skip the extra re-probe round so failover lands quickly.
+    if force:
+        node, s = ranking[0]
+        do_switch(group, node, force=force, reason=reason, from_node=from_node)
+        return node, s, False
     confirmed = confirmed_target(ranking)
     node, s = confirmed if confirmed else ranking[0]
     do_switch(group, node, force=force, reason=reason, from_node=from_node)
@@ -238,6 +284,38 @@ def _apply_decision(
                 "reason": decision.reason,
             }
 
+        if decision.reason in ("pinned failover", "pinned restore"):
+            to_node = decision.to_node
+            to_score = decision.payload.get("to_score", 0)
+            forced = decision.force
+            if not do_switch(group, to_node, force=forced, reason=decision.reason, from_node=cur):
+                if should_defer_switch(force=forced):
+                    return {
+                        "action": "deferred",
+                        "node": cur,
+                        "best": to_node,
+                        "best_score": to_score,
+                        "reason": "active connection",
+                        "group": group,
+                    }
+                return {
+                    "action": "kept",
+                    "node": cur,
+                    "best": to_node,
+                    "best_score": to_score,
+                    "group": group,
+                    "reason": "switch failed",
+                }
+            log(f"{decision.reason}: '{cur}' -> '{to_node}' ({to_score})")
+            return {
+                "action": "switched",
+                "from": cur,
+                "to": to_node,
+                "score": to_score,
+                "group": group,
+                "reason": decision.reason,
+            }
+
         node, s, unconfirmed = _switch_to_confirmed(
             group,
             ranking,
@@ -282,6 +360,7 @@ def pick_and_switch(
     nodes: list[str] | None = None,
     *,
     idle: bool = False,
+    emergency: bool = False,
 ) -> dict:
     global _DEFER_COUNT, _FASTER_CANDIDATE, _FASTER_SINCE
     proxies = fetch_proxies()
@@ -289,25 +368,61 @@ def pick_and_switch(
     nodes = nodes or eligible_nodes(proxies)
     candidates = drop_benched(nodes)
     cur = (proxies.get(group) or {}).get("now")
+    chain = config.pinned_chain()
 
-    if idle and IDLE_SCAN and cur and is_alive(cur):
-        log(f"idle scan: keep '{cur}' (healthy, skipping full rank)")
+    # Pinned-chain members stay probeable even while benched: bench exists to
+    # stop autoswitch flapping onto a flaky node, but the user explicitly
+    # asked for these nodes, so we still want to notice the moment one
+    # recovers instead of waiting out the full bench window.
+    if chain:
+        candidate_set = set(candidates)
+        for n in chain:
+            if n in nodes and n not in candidate_set:
+                candidates.append(n)
+                candidate_set.add(n)
+
+    # A multi-node chain needs a full rank scan each round to notice when a
+    # higher-priority (earlier-in-chain) node has recovered, so skip the
+    # idle fast-path in that case. A single pinned node has no "restore"
+    # concern -- idle_skip is fine as long as it's still alive.
+    if idle and IDLE_SCAN and cur and is_alive(cur) and len(chain) <= 1:
+        if chain and cur == chain[0]:
+            log(f"idle scan: keep pinned '{cur}' (healthy, skipping full rank)")
+        else:
+            log(f"idle scan: keep '{cur}' (healthy, skipping full rank)")
         return {"action": "idle_skip", "node": cur, "reason": "healthy idle scan", "group": group}
 
-    ranking = rank_nodes(candidates)
-    if not ranking:
-        log("!! no reachable node found this scan")
-        return {"action": "none", "reason": "no reachable nodes", "group": group}
-
-    best, best_score = ranking[0]
-    cur_score = next((s for n, s in ranking if n == cur), None)
-    top = ", ".join(f"{n.split('|')[0]}({int(s)})" for n, s in ranking[:3])
     benched = len(nodes) - len(candidates)
-    scan_line = (
-        f"scan: {len(ranking)}/{len(candidates)} ok"
-        + (f" ({benched} benched)" if benched else "")
-        + f" | top: {top}"
-    )
+    if emergency:
+        fast = find_fast_chain_node(chain, candidates) if chain else None
+        if fast:
+            log(f"emergency: pinned chain node '{fast[0]}' reachable -- using it")
+        else:
+            fast = find_fast_node(candidates)
+        if not fast:
+            log("!! no reachable node found this scan")
+            return {"action": "none", "reason": "no reachable nodes", "group": group}
+        ranking = [fast]
+        best, best_score = fast
+        scan_line = (
+            f"emergency: first reachable {best.split('|')[0]}({int(best_score)})"
+            + f" from {len(candidates)} candidates"
+            + (f" ({benched} benched)" if benched else "")
+        )
+    else:
+        ranking = rank_nodes(candidates)
+        if not ranking:
+            log("!! no reachable node found this scan")
+            return {"action": "none", "reason": "no reachable nodes", "group": group}
+        best, best_score = ranking[0]
+        top = ", ".join(f"{n.split('|')[0]}({int(s)})" for n, s in ranking[:3])
+        scan_line = (
+            f"scan: {len(ranking)}/{len(candidates)} ok"
+            + (f" ({benched} benched)" if benched else "")
+            + f" | top: {top}"
+        )
+
+    cur_score = next((s for n, s in ranking if n == cur), None)
     log(scan_line)
     notify(scan_line)
 
@@ -323,6 +438,7 @@ def pick_and_switch(
         defer_count=_DEFER_COUNT,
         faster_candidate=_FASTER_CANDIDATE,
         faster_since=_FASTER_SINCE,
+        trusted_unhealthy=emergency,
     )
     decision = decide(ctx)
     if decision.action == "pending":
@@ -355,26 +471,82 @@ def pick_and_switch(
             f"keep '{cur}' ({int(cur_score or 0)}); best '{best}' ({int(best_score)}) "
             f"not {SWITCH_IMPROVEMENT_PCT}%+ faster for {SWITCH_SUSTAIN_SECONDS}s"
         )
+    elif decision.action == "kept" and decision.reason == "pinned":
+        log(f"keep pinned '{cur}' ({int(cur_score or 0)}); ignoring faster '{best}' ({int(best_score)})")
 
     return _apply_decision(decision, group, ranking, cur)
+
+
+def _resolve_node(node: str, nodes: list[str]) -> str | None:
+    if node in nodes:
+        return node
+    matches = [n for n in nodes if node in n]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def switch_to(node: str) -> str:
     proxies = fetch_proxies()
     group = target_group(proxies)
     nodes = eligible_nodes(proxies)
-    if node not in nodes:
+    resolved = _resolve_node(node, nodes)
+    if resolved is None:
         matches = [n for n in nodes if node in n]
-        if len(matches) == 1:
-            node = matches[0]
-        elif matches:
+        if len(matches) > 1:
             return f"ambiguous ({len(matches)} matches). Be more specific:\n" + "\n".join(matches[:5])
-        else:
-            return f"node not found: {node!r}"
+        return f"node not found: {node!r}"
+    node = resolved
     if do_switch(group, node, force=True, reason="manual"):
         log(f"manual switch -> '{node}'")
         return f"switched {group} -> {node}"
     return f"failed to switch to {node}"
+
+
+def pin_to(*node_names: str) -> str:
+    """Pin to node_names[0], falling back down the list only when a
+    higher-priority entry actually goes down. Restores automatically once a
+    higher-priority entry recovers -- pinned-chain members stay probeable
+    even while benched, and emergency failover tries them (in priority
+    order) before racing the whole node pool. A single name behaves as a
+    plain pin with no preferred fallback.
+    """
+    if not node_names:
+        return "no node given"
+    proxies = fetch_proxies()
+    nodes = eligible_nodes(proxies)
+    resolved: list[str] = []
+    for name in node_names:
+        r = _resolve_node(name, nodes)
+        if r is None:
+            matches = [n for n in nodes if name in n]
+            if len(matches) > 1:
+                return f"ambiguous ({len(matches)} matches for {name!r}). Be more specific:\n" + "\n".join(matches[:5])
+            return f"node not found: {name!r}"
+        resolved.append(r)
+    msg = switch_to(resolved[0])
+    if msg.startswith("switched"):
+        config.set_pinned_chain(resolved)
+        if len(resolved) > 1:
+            chain_desc = " > ".join(resolved)
+            log(f"pinned chain -> {chain_desc}")
+            return f"{msg} (pinned priority: {chain_desc} — falls back only on failure)"
+        log(f"pinned -> '{resolved[0]}'")
+        return f"{msg} (pinned — failover only)"
+    return msg
+
+
+def unpin() -> str:
+    chain = config.pinned_chain()
+    if not chain:
+        return "no pinned node"
+    config.clear_pinned_node()
+    if len(chain) > 1:
+        desc = " > ".join(chain)
+        log(f"unpinned chain: {desc}")
+        return f"unpinned chain: {desc}"
+    log(f"unpinned '{chain[0]}'")
+    return f"unpinned {chain[0]!r}"
 
 
 def format_scan(top_n: int = 10, *, all_nodes: bool = False) -> str:

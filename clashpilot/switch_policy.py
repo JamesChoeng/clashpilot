@@ -41,6 +41,9 @@ class SwitchContext:
     defer_count: int
     faster_candidate: str | None
     faster_since: float
+    # When True, health already confirmed the current node is down — skip a
+    # redundant is_alive re-check before failover.
+    trusted_unhealthy: bool = False
 
 
 @dataclass
@@ -84,6 +87,32 @@ def decide(ctx: SwitchContext) -> SwitchDecision:
             from_node=None,
         )
 
+    chain = config.pinned_chain()
+    if chain:
+        reachable_scores = {n: s for n, s in ctx.ranking}
+        reachable_chain = [n for n in chain if n in reachable_scores]
+        if reachable_chain:
+            top_chain = reachable_chain[0]
+            if cur == top_chain:
+                return SwitchDecision(
+                    action="kept",
+                    reason="pinned",
+                    payload={"node": cur, "best": best, "best_score": int(best_score)},
+                )
+            # A higher-priority chain member is reachable but we're not on it
+            # (either failing over from a dead higher-priority node, or
+            # restoring back up now that it recovered).
+            return SwitchDecision(
+                action="switched",
+                reason="pinned failover" if cur_score is None else "pinned restore",
+                force=(cur_score is None),
+                to_node=top_chain,
+                from_node=cur,
+                payload={"to_score": int(reachable_scores[top_chain])},
+            )
+        # None of the pinned chain is reachable this round -- fall through to
+        # normal autoswitch logic below (may bench/failover the current node).
+
     if cur_score is None:
         if config.opus_whitelist() is not None and cur not in ctx.nodes:
             if should_defer_switch():
@@ -107,7 +136,7 @@ def decide(ctx: SwitchContext) -> SwitchDecision:
                 to_node=best,
                 from_node=cur,
             )
-        if is_alive(cur):
+        if not ctx.trusted_unhealthy and is_alive(cur):
             return SwitchDecision(
                 action="kept",
                 reason="alive but not ranked",

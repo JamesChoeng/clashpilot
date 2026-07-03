@@ -173,6 +173,114 @@ class PickAndSwitchSustainTest(unittest.TestCase):
         mock_switch.assert_called_once()
 
 
+class FindFastNodeTest(unittest.TestCase):
+    @patch("clashpilot.selector.score")
+    def test_returns_first_completed_reachable_node(self, mock_score) -> None:
+        def side_effect(node: str) -> float | None:
+            if node == "node-b":
+                return 80.0
+            return None
+
+        mock_score.side_effect = side_effect
+        result = selector.find_fast_node(["node-a", "node-b", "node-c"])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result[0], "node-b")
+
+    @patch("clashpilot.selector.score", return_value=None)
+    def test_returns_none_when_all_unreachable(self, _mock_score) -> None:
+        self.assertIsNone(selector.find_fast_node(["node-a", "node-b"]))
+
+
+class PickAndSwitchEmergencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        selector._reset_faster_tracking()
+        selector._LAST_SWITCH_TS = 0.0
+        selector._DEFER_COUNT = 0
+
+    @patch("clashpilot.selector.do_switch", return_value=True)
+    @patch("clashpilot.selector.find_fast_node", return_value=("node-b", 60.0))
+    @patch("clashpilot.selector.drop_benched", side_effect=lambda nodes: nodes)
+    @patch("clashpilot.selector.eligible_nodes", return_value=["node-a", "node-b"])
+    @patch(
+        "clashpilot.selector.fetch_proxies",
+        return_value={"AUTO": {"now": "node-a", "type": "Selector"}},
+    )
+    @patch("clashpilot.selector.target_group", return_value="AUTO")
+    def test_emergency_uses_fast_node_path(self, *_mocks) -> None:
+        result = selector.pick_and_switch(emergency=True)
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["to"], "node-b")
+
+    @patch("clashpilot.selector.do_switch", return_value=True)
+    @patch("clashpilot.selector.find_fast_node", return_value=("node-c", 10.0))
+    @patch("clashpilot.selector.find_fast_chain_node", return_value=("node-b", 60.0))
+    @patch("clashpilot.selector.drop_benched", side_effect=lambda nodes: nodes)
+    @patch("clashpilot.selector.eligible_nodes", return_value=["node-a", "node-b", "node-c"])
+    @patch(
+        "clashpilot.selector.fetch_proxies",
+        return_value={"AUTO": {"now": "node-a", "type": "Selector"}},
+    )
+    @patch("clashpilot.selector.target_group", return_value="AUTO")
+    @patch.object(config, "pinned_chain", return_value=["node-a", "node-b"])
+    def test_emergency_prefers_pinned_chain_over_whole_pool_race(
+        self, _pinned, *_mocks
+    ) -> None:
+        # node-c would "win" the whole-pool race (find_fast_node), but node-b
+        # is next in the pinned chain, so it must be preferred instead.
+        result = selector.pick_and_switch(emergency=True)
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["to"], "node-b")
+
+    @patch("clashpilot.selector.do_switch", return_value=True)
+    @patch("clashpilot.selector.find_fast_node", return_value=("node-c", 10.0))
+    @patch("clashpilot.selector.find_fast_chain_node", return_value=None)
+    @patch("clashpilot.selector.drop_benched", side_effect=lambda nodes: nodes)
+    @patch("clashpilot.selector.eligible_nodes", return_value=["node-a", "node-b", "node-c"])
+    @patch(
+        "clashpilot.selector.fetch_proxies",
+        return_value={"AUTO": {"now": "node-a", "type": "Selector"}},
+    )
+    @patch("clashpilot.selector.target_group", return_value="AUTO")
+    @patch.object(config, "pinned_chain", return_value=["node-a", "node-b"])
+    def test_emergency_falls_back_to_whole_pool_when_chain_unreachable(
+        self, _pinned, *_mocks
+    ) -> None:
+        result = selector.pick_and_switch(emergency=True)
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["to"], "node-c")
+
+
+class PinnedChainBenchBypassTest(unittest.TestCase):
+    def setUp(self) -> None:
+        selector._reset_faster_tracking()
+        selector._LAST_SWITCH_TS = 0.0
+        selector._DEFER_COUNT = 0
+
+    @patch("clashpilot.selector.do_switch", return_value=True)
+    @patch("clashpilot.selector.is_alive", return_value=False)
+    @patch("clashpilot.selector.rank_nodes")
+    @patch("clashpilot.selector.drop_benched", side_effect=lambda nodes: ["node-c"])
+    @patch("clashpilot.selector.eligible_nodes", return_value=["node-a", "node-b", "node-c"])
+    @patch(
+        "clashpilot.selector.fetch_proxies",
+        return_value={"AUTO": {"now": "node-b", "type": "Selector"}},
+    )
+    @patch("clashpilot.selector.target_group", return_value="AUTO")
+    @patch.object(config, "pinned_chain", return_value=["node-a", "node-b"])
+    def test_benched_chain_member_still_probed_for_restore(
+        self, _pinned, _target, _fetch, _eligible, _drop_benched, mock_rank, *_mocks
+    ) -> None:
+        # drop_benched excludes node-a and node-b (both benched); the pinned
+        # chain must still be re-added to the probe pool so recovery of
+        # node-a is noticed instead of waiting out the whole bench window.
+        mock_rank.side_effect = lambda candidates: [(n, 50.0) for n in candidates]
+        selector.pick_and_switch()
+        probed = mock_rank.call_args[0][0]
+        self.assertIn("node-a", probed)
+        self.assertIn("node-b", probed)
+
+
 class FormatScanTest(unittest.TestCase):
     @patch("clashpilot.selector.rank_nodes", return_value=[("node-a", 120.0), ("node-b", 200.0)])
     @patch("clashpilot.selector.eligible_nodes", return_value=["node-a", "node-b"])

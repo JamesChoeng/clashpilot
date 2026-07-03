@@ -394,6 +394,51 @@ def last_switch() -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
+def pinned_chain() -> list[str]:
+    """Ordered list of manually-pinned nodes: [primary, fallback1, fallback2, ...].
+
+    autoswitch stays on the highest-priority node in this list that's currently
+    reachable, ignoring faster candidates outside the chain. Falls back down the
+    list only when a higher-priority entry actually goes down, and restores back
+    up automatically once it recovers.
+    """
+    s = get_settings()
+    raw = s.get("pinned_chain")
+    if isinstance(raw, list):
+        chain = [n for n in raw if isinstance(n, str) and n]
+        if chain:
+            return chain
+    legacy = s.get("pinned_node")
+    return [legacy] if isinstance(legacy, str) and legacy else []
+
+
+def pinned_node() -> str | None:
+    chain = pinned_chain()
+    return chain[0] if chain else None
+
+
+def set_pinned_chain(nodes: list[str]) -> None:
+    s = get_settings()
+    s["pinned_chain"] = list(nodes)
+    s.pop("pinned_node", None)
+    save_settings(s)
+
+
+def set_pinned_node(node: str) -> None:
+    set_pinned_chain([node])
+
+
+def clear_pinned_node() -> None:
+    s = get_settings()
+    changed = False
+    for key in ("pinned_chain", "pinned_node"):
+        if key in s:
+            del s[key]
+            changed = True
+    if changed:
+        save_settings(s)
+
+
 def tun_stack() -> str:
     """mihomo TUN stack: system / gvisor / mixed (platform-aware default)."""
     raw = (os.getenv("CLASHPILOT_TUN_STACK") or get_settings().get("tun_stack") or "").strip().lower()
